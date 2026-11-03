@@ -1,0 +1,342 @@
+import os
+import json
+import threading
+from urllib.parse import urlparse
+
+import telebot
+from telebot import types
+
+# Настройки
+TOKEN = "9282714728:AAFWcVNHjSkMTRKh4Epn0-_eZWsNt6M3LvE"
+
+if not TOKEN or TOKEN.startswith("ВСТАВЬ_"):
+    raise RuntimeError("Вставь настоящий токен Telegram-бота")
+
+DATA_FILE = "bot_data.json"
+AD_CREATE_COST = 1000
+AD_REWARD = 10
+
+
+bot = telebot.TeleBot(TOKEN)
+lock = threading.RLock()
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+
+    data.setdefault("users", {})
+    data.setdefault("ads", {})
+    return data
+
+
+data = load_data()
+
+
+def save_data():
+    with lock:
+        temp = DATA_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp, DATA_FILE)
+
+
+def get_user(user_id):
+    uid = str(user_id)
+    with lock:
+        if uid not in data["users"]:
+            data["users"][uid] = {
+                "balance": 0,
+                "completed_ads": []
+            }
+        user = data["users"][uid]
+        user.setdefault("balance", 0)
+        user.setdefault("completed_ads", [])
+        return user
+
+
+def main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📢 Реклама", "💰 Баланс")
+    markup.row("📋 Задания", "➕ Создать рекламу")
+    return markup
+
+
+def valid_channel_link(value):
+    value = value.strip()
+    if value.startswith("@"):
+        return len(value) > 1 and value[1:].replace("_", "").isalnum()
+
+    parsed = urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.lower() in ("t.me", "www.t.me")
+        and len(parsed.path.strip("/").split("/")) == 1
+        and parsed.path.strip("/") != ""
+    )
+
+
+def channel_chat_id(value):
+    value = value.strip()
+    if value.startswith("@"):
+        return value
+    parsed = urlparse(value)
+    username = parsed.path.strip("/").split("/")[0]
+    return f"@{username}"
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    get_user(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        "Добро пожаловать! Выбери действие:",
+        reply_markup=main_menu()
+    )
+
+
+@bot.message_handler(commands=["cancel"])
+def cancel(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        "Действие отменено.",
+        reply_markup=main_menu()
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def balance(message):
+    user = get_user(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        f"💰 Твой баланс: {user['balance']} баллов",
+        reply_markup=main_menu()
+    )
+
+
+
+
+
+@bot.message_handler(func=lambda m: m.text == "📢 Реклама")
+def show_ads(message):
+    user = get_user(message.from_user.id)
+    uid = str(message.from_user.id)
+
+    with lock:
+        ads = list(data["ads"].items())
+
+    available = [
+        (ad_id, ad)
+        for ad_id, ad in ads
+        if ad.get("active", True)
+        and ad_id not in user["completed_ads"]
+        and ad.get("owner") != uid
+    ]
+
+    if not available:
+        bot.send_message(message.chat.id, "Сейчас нет доступных заданий.")
+        return
+
+    for ad_id, ad in available:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "📢 Перейти к каналу",
+                url=ad["channel"]
+                if ad["channel"].startswith("https://")
+                else "https://t.me/" + ad["channel"].lstrip("@")
+            )
+        )
+        markup.add(
+            types.InlineKeyboardButton(
+                "✅ Проверить подписку",
+                callback_data=f"check:{ad_id}"
+            )
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"📢 {ad['title']}\n"
+            f"Канал: {ad['channel']}\n"
+            f"Награда: {ad['reward']} баллов",
+            reply_markup=markup
+        )
+
+
+@bot.message_handler(func=lambda m: m.text == "➕ Создать рекламу")
+def create_ad_start(message):
+    user = get_user(message.from_user.id)
+
+    if user["balance"] < AD_CREATE_COST:
+        bot.send_message(
+            message.chat.id,
+            f"Для создания рекламы нужно {AD_CREATE_COST} баллов.\n"
+            f"Твой баланс: {user['balance']}"
+        )
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "Отправь название рекламного задания (до 200 символов):"
+    )
+    bot.register_next_step_handler(msg, create_ad_title)
+
+
+def create_ad_title(message):
+    if message.text == "/cancel":
+        return cancel(message)
+
+    title = (message.text or "").strip()
+    if not title or len(title) > 200:
+        msg = bot.send_message(
+            message.chat.id,
+            "Название должно содержать от 1 до 200 символов. Попробуй ещё раз:"
+        )
+        bot.register_next_step_handler(msg, create_ad_title)
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "Отправь ссылку на публичный канал (https://t.me/channel):"
+    )
+    bot.register_next_step_handler(msg, create_ad_channel, title)
+
+
+def create_ad_channel(message, title):
+    if message.text == "/cancel":
+        return cancel(message)
+
+    channel = (message.text or "").strip()
+    if not valid_channel_link(channel):
+        msg = bot.send_message(
+            message.chat.id,
+            "Неверная ссылка. Используй https://t.me/channel или @channel:"
+        )
+        bot.register_next_step_handler(msg, create_ad_channel, title)
+        return
+
+    user = get_user(message.from_user.id)
+    uid = str(message.from_user.id)
+
+    with lock:
+        if user["balance"] < AD_CREATE_COST:
+            bot.send_message(message.chat.id, "Недостаточно баллов.")
+            return
+
+        ad_id = str(max(
+            [int(x) for x in data["ads"] if x.isdigit()] + [0]
+        ) + 1)
+
+        data["ads"][ad_id] = {
+            "owner": uid,
+            "title": title,
+            "channel": channel,
+            "reward": AD_REWARD,
+            "active": True,
+            "completed_users": []
+        }
+        user["balance"] -= AD_CREATE_COST
+        save_data()
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Реклама создана!\n"
+        f"Списано: {AD_CREATE_COST} баллов\n"
+        f"Номер задания: {ad_id}",
+        reply_markup=main_menu()
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("check:"))
+def check_subscription(call):
+    ad_id = call.data.split(":", 1)[1]
+    uid = str(call.from_user.id)
+
+    with lock:
+        ad = data["ads"].get(ad_id)
+
+        if not ad or not ad.get("active", True):
+            bot.answer_callback_query(
+                call.id,
+                "Задание недоступно.",
+                show_alert=True
+            )
+            return
+
+        user = get_user(call.from_user.id)
+
+        if ad.get("owner") == uid:
+            bot.answer_callback_query(
+                call.id,
+                "Нельзя выполнять собственное задание.",
+                show_alert=True
+            )
+            return
+
+        if uid in user["completed_ads"]:
+            bot.answer_callback_query(
+                call.id,
+                "Ты уже выполнил это задание.",
+                show_alert=True
+            )
+            return
+
+        channel_id = channel_chat_id(ad["channel"])
+
+    try:
+        member = bot.get_chat_member(channel_id, call.from_user.id)
+        if member.status not in ("member", "administrator", "creator"):
+            bot.answer_callback_query(
+                call.id,
+                "Сначала подпишись на канал!",
+                show_alert=True
+            )
+            return
+    except Exception:
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось проверить подписку. Проверь, что бот — администратор канала.",
+            show_alert=True
+        )
+        return
+
+    with lock:
+        # Повторная проверка перед начислением
+        ad = data["ads"].get(ad_id)
+        user = get_user(call.from_user.id)
+
+        if (
+            not ad
+            or not ad.get("active", True)
+            or uid in user["completed_ads"]
+        ):
+            bot.answer_callback_query(
+                call.id,
+                "Задание уже выполнено или недоступно.",
+                show_alert=True
+            )
+            return
+
+        reward = int(ad.get("reward", AD_REWARD))
+        user["balance"] += reward
+        user["completed_ads"].append(ad_id)
+        ad.setdefault("completed_users", []).append(uid)
+        save_data()
+
+    bot.answer_callback_query(call.id, "Подписка подтверждена!")
+    bot.send_message(
+        call.message.chat.id,
+        f"🎉 Начислено {reward} баллов!",
+        reply_markup=main_menu()
+    )
+
+
+print("Бот запущен")
+bot.infinity_polling(skip_pending=True)
